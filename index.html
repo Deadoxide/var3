@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8" />
+    <title>УВМ — Web GUI (JS-версия)</title>
+
+    <style>
+        body {
+            margin: 0;
+            font-family: sans-serif;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        header {
+            padding: 8px 12px;
+            background: #222;
+            color: #fff;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .container {
+            flex: 1;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 4px;
+            padding: 4px;
+            box-sizing: border-box;
+        }
+
+        .panel {
+            display: flex;
+            flex-direction: column;
+            height: 100%;
+        }
+
+        .panel label {
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+
+        textarea, pre {
+            flex: 1;
+            width: 100%;
+            box-sizing: border-box;
+            resize: none;
+            font-family: monospace;
+            font-size: 14px;
+            padding: 8px;
+        }
+
+        pre {
+            background: #111;
+            color: #0f0;
+            overflow: auto;
+        }
+
+        button {
+            padding: 6px 12px;
+            margin-left: 8px;
+            cursor: pointer;
+        }
+
+        .toolbar {
+            display: flex;
+            align-items: center;
+        }
+    </style>
+</head>
+
+<body>
+<header>
+    <div>УВМ — Web GUI (ASM → байткод → интерпретатор)</div>
+    <div class="toolbar">
+        <button id="run-btn">Ассемблировать и выполнить</button>
+    </div>
+</header>
+
+<div class="container">
+    <div class="panel">
+        <label for="editor">Исходный код (ASM):</label>
+        <textarea id="editor" spellcheck="false">
+# Примеры из спецификации:
+
+load_const; 381      # A=14, B=381 → 0x8E 0xBE 0x00 0x00 0x00
+read_value; 435      # A=11, B=435 → 0x8B 0xD9 0x00 0x00 0x00
+write_value; 308     # A=94, B=308 → 0x5E 0x9A 0x00 0x00 0x00
+less; 989            # A=69, B=989 → 0xC5 0xEE 0x01 0x00 0x00
+        </textarea>
+    </div>
+
+    <div class="panel">
+        <label for="output">Вывод (байт-код + лог + память):</label>
+        <pre id="output">Нажмите "Ассемблировать и выполнить"</pre>
+    </div>
+</div>
+
+<script>
+    // =========================
+    // Ассемблер (5 байт, поля A/B)
+    // =========================
+
+    const OP_LOAD_CONST = 14; // Загрузка константы
+    const OP_READ       = 11; // Чтение значения из памяти
+    const OP_WRITE      = 94; // Запись значения в память
+    const OP_LESS       = 69; // Бинарная операция "<"
+
+    const OPCODE_NAMES = {
+        [OP_LOAD_CONST]: "load_const",
+        [OP_READ]:       "read_value",
+        [OP_WRITE]:      "write_value",
+        [OP_LESS]:       "less",
+    };
+
+    function packInstruction(a, b) {
+        // A: 7 бит, B: 26 бит
+        if (a < 0 || a >= (1 << 7)) {
+            throw new Error("Поле A должно быть 0..127, получено " + a);
+        }
+        if (b < 0 || b >= (1 << 26)) {
+            throw new Error("Поле B должно помещаться в 26 бит, получено " + b);
+        }
+
+        let value = a + (b << 7); // JS number, до 2^53-1 — норм
+
+        const bytes = [];
+        for (let i = 0; i < 5; i++) {
+            bytes.push(value & 0xFF);
+            value = value >> 8;
+        }
+        return bytes;
+    }
+
+    function asm_load_const(constVal) {
+        return packInstruction(OP_LOAD_CONST, constVal);
+    }
+
+    function asm_read_value(address) {
+        return packInstruction(OP_READ, address);
+    }
+
+    function asm_write_value(address) {
+        return packInstruction(OP_WRITE, address);
+    }
+
+    function asm_less(address) {
+        return packInstruction(OP_LESS, address);
+    }
+
+    function asm_from_IR(IR) {
+        let bytecode = [];
+        for (const item of IR) {
+            const op = item[0];
+            const arg = item[1];
+            if (op === "load_const") {
+                bytecode = bytecode.concat(asm_load_const(arg));
+            } else if (op === "read_value") {
+                bytecode = bytecode.concat(asm_read_value(arg));
+            } else if (op === "write_value") {
+                bytecode = bytecode.concat(asm_write_value(arg));
+            } else if (op === "less") {
+                bytecode = bytecode.concat(asm_less(arg));
+            } else {
+                throw new Error("Неизвестная команда ассемблера: " + op);
+            }
+        }
+        return bytecode;
+    }
+
+    function full_asm(text) {
+        const lines = text.split(/\r?\n/);
+        const IR = [];
+
+        for (let rawLine of lines) {
+            let line = rawLine.trim();
+            if (!line) continue;
+            const hashIndex = line.indexOf("#");
+            if (hashIndex !== -1) {
+                line = line.slice(0, hashIndex).trim();
+            }
+            if (!line) continue;
+
+            const parts = line.split(";");
+            const cmd = parts[0].trim();
+
+            if (parts.length < 2 || !parts[1].trim()) {
+                throw new Error("Команда '" + cmd + "' требует аргумент: '" + cmd + "; число'");
+            }
+            const argStr = parts[1].trim();
+            const arg = parseInt(argStr, 10);
+            if (Number.isNaN(arg)) {
+                throw new Error("Аргумент команды '" + cmd + "' не число: " + argStr);
+            }
+
+            IR.push([cmd, arg]);
+        }
+
+        const bytecode = asm_from_IR(IR);
+        return { bytecode, IR };
+    }
+
+    // =========================
+    // Модель памяти + интерпретатор
+    // =========================
+
+class UVMMemory {
+    constructor(size = 2048) {   // <<< было 256, сделали 2048
+        this.data = new Array(size).fill(0);
+        this.ip = 0;   // instruction pointer
+        this.acc = 0;  // аккумулятор
+    }
+
+    readData(addr) {
+        if (addr < 0 || addr >= this.data.length) {
+            throw new Error("Недопустимый адрес чтения: " + addr);
+        }
+        return this.data[addr];
+    }
+
+    writeData(addr, value) {
+        if (addr < 0 || addr >= this.data.length) {
+            throw new Error("Недопустимый адрес записи: " + addr);
+        }
+        this.data[addr] = value;
+    }
+}
+
+
+    function decodeInstruction(bytes) {
+        if (bytes.length !== 5) {
+            throw new Error("Ожидалось 5 байт, получено " + bytes.length);
+        }
+        let value = 0;
+        for (let i = 0; i < 5; i++) {
+            value += bytes[i] << (8 * i);
+        }
+        const a = value & 0x7F;
+        const b = value >> 7;
+        const cmdName = OPCODE_NAMES[a];
+        if (!cmdName) {
+            throw new Error("Неизвестный opcode (A): " + a);
+        }
+        return { cmd: cmdName, operand: b };
+    }
+
+    function runProgram(bytecode, memory) {
+        const instrCount = Math.floor(bytecode.length / 5);
+        const log = [];
+        log.push(`[INFO] Запуск программы. Всего инструкций: ${instrCount}`);
+
+        while (memory.ip < instrCount) {
+            const ip = memory.ip;
+            const base = ip * 5;
+            const instrBytes = bytecode.slice(base, base + 5);
+
+            let decoded;
+            try {
+                decoded = decodeInstruction(instrBytes);
+            } catch (e) {
+                log.push(`[RUNTIME ERROR] На IP=${ip}: ${e.message}`);
+                break;
+            }
+
+            const cmd = decoded.cmd;
+            const B = decoded.operand;
+
+            log.push(
+                `[${String(ip).padStart(3, "0")}] ${cmd.padEnd(12, " ")} | B=${B} | ACC=${memory.acc}`
+            );
+
+            memory.ip = ip + 1;
+
+            if (cmd === "load_const") {
+                memory.acc = B;
+            } else if (cmd === "read_value") {
+                memory.acc = memory.readData(B);
+            } else if (cmd === "write_value") {
+                memory.writeData(B, memory.acc);
+            } else if (cmd === "less") {
+                const lhs = memory.readData(B);
+                const rhs = memory.acc;
+                memory.writeData(B, lhs < rhs ? 1 : 0);
+            } else {
+                log.push(`[RUNTIME ERROR] Неизвестная команда: ${cmd}`);
+                break;
+            }
+        }
+
+        log.push("");
+        log.push(`--- Выполнение завершено на IP=${memory.ip} ---`);
+        log.push(`ACC=${memory.acc}`);
+        log.push(`Память (первые 16 ячеек): ${memory.data.slice(0, 16).join(", ")}`);
+
+        return log.join("\n");
+    }
+
+    // =========================
+    // Обработчик кнопки
+    // =========================
+
+    function runUVM() {
+        const editor = document.getElementById("editor");
+        const output = document.getElementById("output");
+        const src = editor.value;
+
+        if (!src.trim()) {
+            output.textContent = "[WARN] Исходный текст пуст.";
+            return;
+        }
+
+        try {
+            const { bytecode } = full_asm(src);
+
+            // Байткод в hex
+            const hexBytes = bytecode
+                .map(b => "0x" + b.toString(16).toUpperCase().padStart(2, "0"))
+                .join(" ");
+
+            const mem = new UVMMemory();
+            const log = runProgram(bytecode, mem);
+
+            const result =
+                "--- Сгенерированный байт-код ---\n" +
+                hexBytes +
+                "\n\n--- Лог выполнения ---\n" +
+                log;
+
+            output.textContent = result;
+        } catch (e) {
+            output.textContent = "[ERROR] " + e.message;
+        }
+    }
+
+    document.getElementById("run-btn").addEventListener("click", runUVM);
+</script>
+
+</body>
+</html>
